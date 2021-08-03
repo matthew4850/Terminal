@@ -198,7 +198,7 @@ namespace Microsoft::Console::Render
             {
                 uint64_t x = entry.value;
                 x ^= x >> 33;
-                x *= UINT64_C(0xff51afd7ed558ccd);
+                x *= 0xff51afd7ed558ccdULL;
                 x ^= x >> 33;
                 return static_cast<size_t>(x);
             }
@@ -213,7 +213,12 @@ namespace Microsoft::Console::Render
 
         struct cell
         {
-            u32 glyphIndex;
+            union
+            {
+                u32 glyphIndex;
+                u16x2 glyphIndex16;
+            };
+            u32 flags;
             u32x2 color;
         };
 
@@ -241,7 +246,9 @@ namespace Microsoft::Console::Render
         // text handling
         inline IDWriteTextFormat* _getTextFormat(bool bold, bool italic) const noexcept { return _r.textFormats[italic][bold].get(); }
         wil::com_ptr<IDWriteTextFormat> _createTextFormat(const wchar_t* fontFamilyName, DWRITE_FONT_WEIGHT fontWeight, DWRITE_FONT_STYLE fontStyle, float fontSize, const wchar_t* localeName) const;
-        void _generateGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>& pair);
+        void _drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>& pair);
+        void _drawCursor();
+        void _copyScratchpadCell(uint32_t scratchpadIndex, u16x2 target, uint32_t copyFlags = 0);
 
         inline cell* _getCell(COORD coord) noexcept
         {
@@ -292,7 +299,7 @@ namespace Microsoft::Console::Render
             // D2D resources
             wil::com_ptr<ID3D11Texture2D> glyphBuffer;
             wil::com_ptr<ID3D11ShaderResourceView> glyphView;
-            wil::com_ptr<ID3D11Texture2D> glyphScratchpadBuffer;
+            wil::com_ptr<ID3D11Texture2D> glyphScratchpad;
             wil::com_ptr<ID2D1RenderTarget> d2dRenderTarget;
             wil::com_ptr<ID2D1Brush> brush;
             wil::com_ptr<IDWriteTextFormat> textFormats[2][2];

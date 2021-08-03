@@ -97,6 +97,7 @@ AtlasEngine::AtlasEngine()
     THROW_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, _uuidof(_sr.d2dFactory), _sr.d2dFactory.put_void()));
     THROW_IF_FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(_sr.dwriteFactory), _sr.dwriteFactory.put_unknown()));
     _sr.isWindows10OrGreater = IsWindows10OrGreater();
+    _r.glyphQueue.reserve(64);
 }
 
 #pragma region IRenderEngine
@@ -143,6 +144,7 @@ try
         }
     }
 
+    _rapi.dirtyArea = til::rectangle{ 0u, 0u, static_cast<size_t>(_api.cellCount.x), static_cast<size_t>(_api.cellCount.y) };
     return S_OK;
 }
 catch (const wil::ResultException& exception)
@@ -182,9 +184,8 @@ try
     {
         for (const auto& pair : _r.glyphQueue)
         {
-            _generateGlyph(pair);
+            _drawGlyph(pair);
         }
-
         _r.glyphQueue.clear();
     }
 
@@ -325,7 +326,8 @@ CATCH_RETURN()
 
         for (uint32_t i = 0; i < cells; ++i)
         {
-            memcpy(&data[i].glyphIndex, &coords[i], sizeof(coords));
+            data[i].glyphIndex16 = coords[i];
+            data[i].flags = 0;
             data[i].color = _rapi.currentColor;
         }
 
@@ -349,6 +351,14 @@ CATCH_RETURN()
 
 [[nodiscard]] HRESULT AtlasEngine::PaintCursor(const CursorOptions& options) noexcept
 {
+    auto data = _getCell(options.coordCursor);
+    const auto end = std::min(data + options.fIsDoubleWidth + 1, _r.cells.data() + _r.cells.size());
+
+    for (; data != end; ++data)
+    {
+        data->flags = u32(options.isOn);
+    }
+
     return S_OK;
 }
 
@@ -403,7 +413,6 @@ CATCH_RETURN()
 
 [[nodiscard]] HRESULT AtlasEngine::GetDirtyArea(gsl::span<const til::rectangle>& area) noexcept
 {
-    _rapi.dirtyArea = til::rectangle{ 0u, 0u, static_cast<size_t>(_api.cellCount.x), static_cast<size_t>(_api.cellCount.y) };
     area = gsl::span{ &_rapi.dirtyArea, 1 };
     return S_OK;
 }
@@ -418,8 +427,16 @@ CATCH_RETURN()
 
 [[nodiscard]] HRESULT AtlasEngine::IsGlyphWideByFont(const std::wstring_view& glyph, _Out_ bool* const pResult) noexcept
 {
-    *pResult = false;
-    return S_FALSE;
+    RETURN_HR_IF_NULL(E_INVALIDARG, pResult);
+
+    wil::com_ptr<IDWriteTextLayout> textLayout;
+    RETURN_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(glyph.data(), yolo_narrow<uint32_t>(glyph.size()), _getTextFormat(false, false), FLT_MAX, FLT_MAX, textLayout.put()));
+
+    DWRITE_TEXT_METRICS metrics;
+    RETURN_IF_FAILED(textLayout->GetMetrics(&metrics));
+
+    *pResult = std::ceil(metrics.width) > _api.cellSize.x;
+    return S_OK;
 }
 
 [[nodiscard]] HRESULT AtlasEngine::UpdateTitle(const std::wstring_view newTitle) noexcept
@@ -698,8 +715,8 @@ void AtlasEngine::_createResources()
         THROW_IF_FAILED(_r.device->CreateBuffer(&desc, nullptr, _r.constantBuffer.put()));
     }
 
-    THROW_IF_FAILED(_r.device->CreateVertexShader(&shader_vs[0], sizeof(shader_vs), nullptr, _r.vertexShader.put()));
-    THROW_IF_FAILED(_r.device->CreatePixelShader(&shader_ps[0], sizeof(shader_ps), nullptr, _r.pixelShader.put()));
+    THROW_IF_FAILED(_r.device->CreateVertexShader(shader_vs, sizeof(shader_vs), nullptr, _r.vertexShader.put()));
+    THROW_IF_FAILED(_r.device->CreatePixelShader(shader_ps, sizeof(shader_ps), nullptr, _r.pixelShader.put()));
 
     if (_api.swapChainChangedCallback)
     {
@@ -813,6 +830,8 @@ void AtlasEngine::_recreateFontDependentResources()
         _r.glyphs = {};
         _r.glyphQueue = {};
         _r.atlasSizeInPixel = _api.cellSize * u16x2{ yolo_narrow<u16>(xFit), yolo_narrow<u16>(yFit) };
+        // The first cell at {0, 0} is always our cursor texture.
+        // --> The first glyph starts at {1, 0}.
         _r.atlasPosition = _api.cellSize * u16x2{ 1, 0 };
     }
     {
@@ -838,7 +857,7 @@ void AtlasEngine::_recreateFontDependentResources()
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc = { 1, 0 };
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        THROW_IF_FAILED(_r.device->CreateTexture2D(&desc, nullptr, _r.glyphScratchpadBuffer.put()));
+        THROW_IF_FAILED(_r.device->CreateTexture2D(&desc, nullptr, _r.glyphScratchpad.put()));
     }
     {
         D2D1_RENDER_TARGET_PROPERTIES props{};
@@ -846,7 +865,7 @@ void AtlasEngine::_recreateFontDependentResources()
         props.pixelFormat = { DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED };
         props.dpiX = static_cast<float>(_api.dpi);
         props.dpiY = static_cast<float>(_api.dpi);
-        const auto surface = _r.glyphScratchpadBuffer.query<IDXGISurface>();
+        const auto surface = _r.glyphScratchpad.query<IDXGISurface>();
         THROW_IF_FAILED(_sr.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.get(), &props, _r.d2dRenderTarget.put()));
         // We don't really use D2D for anything except DWrite, but it
         // can't hurt to ensure that everything it does is pixel aligned.
@@ -876,6 +895,7 @@ void AtlasEngine::_recreateFontDependentResources()
     }
 
     _recreateDependentResourcesCommon();
+    _drawCursor();
 }
 
 void AtlasEngine::_recreateDependentResourcesCommon()
@@ -899,10 +919,11 @@ wil::com_ptr<IDWriteTextFormat> AtlasEngine::_createTextFormat(const wchar_t* fo
 {
     wil::com_ptr<IDWriteTextFormat> textFormat;
     THROW_IF_FAILED(_sr.dwriteFactory->CreateTextFormat(fontFamilyName, nullptr, fontWeight, fontStyle, DWRITE_FONT_STRETCH_NORMAL, fontSize, localeName, textFormat.addressof()));
+    textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     return textFormat;
 }
 
-void AtlasEngine::_generateGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>& pair)
+void AtlasEngine::_drawGlyph(const til::pair<glyph_entry, std::array<u16x2, 2>>& pair)
 {
     wchar_t chars[2];
     const auto entry = pair.first;
@@ -918,24 +939,56 @@ void AtlasEngine::_generateGlyph(const til::pair<glyph_entry, std::array<u16x2, 
     rect.right = static_cast<float>(cells * _api.cellSize.x);
     rect.bottom = static_cast<float>(_api.cellSize.y);
 
-    _r.d2dRenderTarget->BeginDraw();
-    _r.d2dRenderTarget->Clear();
-    _r.d2dRenderTarget->DrawTextW(chars, charsLength, textFormat, &rect, _r.brush.get(), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, DWRITE_MEASURING_MODE_NATURAL);
-    THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
+    {
+        // See D2DFactory::DrawText
+        wil::com_ptr<IDWriteTextLayout> textLayout;
+        THROW_IF_FAILED(_sr.dwriteFactory->CreateTextLayout(chars, charsLength, textFormat, static_cast<float>(cells * _api.cellSize.x), static_cast<float>(_api.cellSize.y), textLayout.put()));
+
+        _r.d2dRenderTarget->BeginDraw();
+        _r.d2dRenderTarget->Clear();
+        _r.d2dRenderTarget->DrawTextLayout({}, textLayout.get(), _r.brush.get(), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
+    }
 
     for (uint32_t i = 0; i < cells; ++i)
     {
-        const auto coords = pair.second[i];
-        D3D11_BOX box;
-        box.left = i * _api.cellSize.x;
-        box.top = 0;
-        box.front = 0;
-        box.right = (i + 1) * _api.cellSize.x;
-        box.bottom = _api.cellSize.y;
-        box.back = 1;
         // Specifying NO_OVERWRITE means that the system can assume that existing references to the surface that
         // may be in flight on the GPU will not be affected by the update, so the copy can proceed immediately
         // (avoiding either a batch flush or the system maintaining multiple copies of the resource behind the scenes).
-        _r.deviceContext->CopySubresourceRegion1(_r.glyphBuffer.get(), 0, coords.x, coords.y, 0, _r.glyphScratchpadBuffer.get(), 0, &box, D3D11_COPY_NO_OVERWRITE);
+        // 
+        // Since our shader only draws whatever is in the atlas, and since we don't replace glyph cells that are in use,
+        // we can safely (?) tell the GPU that we don't overwrite parts of our atlas that are in use.
+        _copyScratchpadCell(i, pair.second[i], D3D11_COPY_NO_OVERWRITE);
     }
+}
+
+void AtlasEngine::_drawCursor()
+{
+    D2D1_RECT_F rect;
+    rect.left = 0;
+    rect.top = static_cast<float>(_api.cellSize.y) * 0.81f;
+    rect.right = static_cast<float>(_api.cellSize.x);
+    rect.bottom = static_cast<float>(_api.cellSize.y);
+
+    _r.d2dRenderTarget->BeginDraw();
+    _r.d2dRenderTarget->Clear();
+    _r.d2dRenderTarget->FillRectangle(&rect, _r.brush.get());
+    THROW_IF_FAILED(_r.d2dRenderTarget->EndDraw());
+
+    _copyScratchpadCell(0, {});
+}
+
+void AtlasEngine::_copyScratchpadCell(uint32_t scratchpadIndex, u16x2 target, uint32_t copyFlags)
+{
+    D3D11_BOX box;
+    box.left = scratchpadIndex * _api.cellSize.x;
+    box.top = 0;
+    box.front = 0;
+    box.right = (scratchpadIndex + 1) * _api.cellSize.x;
+    box.bottom = _api.cellSize.y;
+    box.back = 1;
+    // Specifying NO_OVERWRITE means that the system can assume that existing references to the surface that
+    // may be in flight on the GPU will not be affected by the update, so the copy can proceed immediately
+    // (avoiding either a batch flush or the system maintaining multiple copies of the resource behind the scenes).
+    _r.deviceContext->CopySubresourceRegion1(_r.glyphBuffer.get(), 0, target.x, target.y, 0, _r.glyphScratchpad.get(), 0, &box, copyFlags);
 }

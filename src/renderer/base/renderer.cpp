@@ -15,8 +15,6 @@ using PointTree = interval_tree::IntervalTree<til::point, size_t>;
 static constexpr auto maxRetriesForRenderEngine = 3;
 // The renderer will wait this number of milliseconds * how many tries have elapsed before trying again.
 static constexpr auto renderBackoffBaseTimeMilliseconds{ 150 };
-static constexpr std::wstring_view emptyBufferCell{ L"\0", 1 };
-static constexpr std::wstring_view spaceBufferCell{ L" ", 1 };
 
 #define forEachEngine(var)    \
     for (auto var : _engines) \
@@ -758,14 +756,6 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
             // Run contains wide character (>1 columns)
             bool containsWideCharacter = false;
 
-            // The buffer uses virtual memory and rows might not be initialized yet.
-            // To us they'll appear as if they contain \0, but we don't want to pass that to the renderer.
-            auto chars = it->Chars();
-            if (chars == emptyBufferCell)
-            {
-                chars = spaceBufferCell;
-            }
-
             // This inner loop will accumulate clusters until the color changes.
             // When the color changes, it will save the new color off and break.
             // We also accumulate clusters according to regex patterns
@@ -778,7 +768,7 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
                     auto newAttr{ it->TextAttr() };
                     // foreground doesn't matter for runs of spaces (!)
                     // if we trick it . . . we call Paint far fewer times for cmatrix
-                    if (!_IsAllSpaces(chars) || !newAttr.HasIdenticalVisualRepresentationForBlankSpace(color, globalInvert) || patternIds != thisPointPatterns)
+                    if (!_IsAllSpaces(it->Chars()) || !newAttr.HasIdenticalVisualRepresentationForBlankSpace(color, globalInvert) || patternIds != thisPointPatterns)
                     {
                         color = newAttr;
                         patternIds = thisPointPatterns;
